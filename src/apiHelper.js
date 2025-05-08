@@ -1,4 +1,5 @@
 const axios = require('axios');
+const googleIt = require('google-it'); // 新增：导入 google-it 包
 
 // 从环境变量加载配置
 const API_URL = process.env.API_URL;
@@ -83,14 +84,47 @@ async function callApi(modelName, messages, temperature, maxTokens, useSearchToo
             for (const toolCall of firstMessage.tool_calls) {
                  if (toolCall.type === 'function' && toolCall.function.name === 'google_search') {
                      const toolCallId = toolCall.id;
-                     const functionArgs = toolCall.function.arguments;
-                     console.log(`Constructing tool result for call_id: ${toolCallId}, args: ${functionArgs}`);
+                     let searchQuery = "Unknown query";
+                     try {
+                         const functionArgsParsed = JSON.parse(toolCall.function.arguments);
+                         searchQuery = functionArgsParsed.query;
+                     } catch (e) {
+                         console.error(`Error parsing search query from tool call arguments: ${toolCall.function.arguments}`, e);
+                         messagesForSecondCall.push({
+                             role: 'tool',
+                             tool_call_id: toolCallId,
+                             name: 'google_search',
+                             content: `[Error: Could not parse search query: ${toolCall.function.arguments}]`,
+                         });
+                         continue; // Skip to next tool call if parsing fails
+                     }
+
+                     console.log(`Performing Google search for query: "${searchQuery}" (Call ID: ${toolCallId})`);
+                     let searchResultContent = `[No results found for query: ${searchQuery}]`; // Default if search fails or returns no results
+
+                     try {
+                         const searchResults = await googleIt({ query: searchQuery, limit: 5, disableConsole: true }); // Limit to 5 results
+                         if (searchResults && searchResults.length > 0) {
+                             searchResultContent = "Search Results:\n";
+                             searchResults.forEach((item, index) => {
+                                 searchResultContent += `Result ${index + 1}:\nTitle: ${item.title}\nLink: ${item.link}\nSnippet: ${item.snippet}\n\n`;
+                             });
+                             // Limit total length of search results to avoid overly long context for the AI
+                             if (searchResultContent.length > 4000) {
+                                 searchResultContent = searchResultContent.substring(0, 3997) + "...";
+                             }
+                         }
+                         console.log(`Search for "${searchQuery}" returned ${searchResults.length} results.`);
+                     } catch (searchError) {
+                         console.error(`Error performing Google search for "${searchQuery}":`, searchError);
+                         searchResultContent = `[Error performing search for query: ${searchQuery}. Details: ${searchError.message}]`;
+                     }
+
                      messagesForSecondCall.push({
                          role: 'tool',
                          tool_call_id: toolCallId,
                          name: 'google_search',
-                         // Content can be simple confirmation, proxy handles actual execution.
-                         content: `[Tool call processed for google_search with args: ${functionArgs}]`,
+                         content: searchResultContent,
                      });
                  }
             }

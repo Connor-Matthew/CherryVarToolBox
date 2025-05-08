@@ -1,7 +1,11 @@
 // server.js
-const express = require('express');
-const fetch = require('node-fetch');
 const dotenv = require('dotenv');
+// 加载环境变量，确保在所有其他 require 之前执行，以便 process.env 生效
+dotenv.config({ path: 'config.env' });
+
+const express = require('express');
+const fetch = require('node-fetch'); // 虽然 fetchAndUpdateWeather 将不再直接使用它，但其他地方可能用，暂不移除
+const apiHelper = require('./src/apiHelper'); // <--- 引入 apiHelper
 const schedule = require('node-schedule');
 const lunarCalendar = require('chinese-lunar-calendar'); // 导入整个模块
 const fs = require('fs').promises; // 使用 fs.promises 进行异步文件操作
@@ -9,9 +13,6 @@ const path = require('path');
 const { Writable } = require('stream'); // 引入 Writable 用于收集流数据
 const crypto = require('crypto'); // 新增：用于生成 UUID
 const cors = require('cors'); // <--- 引入 cors
-
-// 加载环境变量
-dotenv.config({ path: 'config.env' });
 
 // --- 新增：图片转译和缓存相关 ---
 const imageModelName = process.env.ImageModel;
@@ -385,120 +386,37 @@ async function fetchAndUpdateWeather() {
         // 假设 weatherPromptTemplate 在这里已经是原始模板，需要替换
         prompt = prompt.replace(/\{\{VarCity\}\}/g, process.env.VarCity || '默认城市');
 
-        // --- First API Call ---
-        const weatherModelMaxTokens = parseInt(process.env.WeatherModelMaxTokens, 10); // 读取配置
-        const firstApiPayload = {
-            model: weatherModel,
-            messages: [{ role: 'user', content: prompt }],
-            tools: [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "google_search",
-                        "description": "Perform a Google search to find information on the web.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "The search query."
-                                }
-                            },
-                            "required": ["query"]
-                        }
-                    }
-                }
-            ],
-            tool_choice: "auto"
-        };
+        const weatherModelMaxTokens = parseInt(process.env.WeatherModelMaxTokens, 10);
+        const weatherTemperature = 0.5; // Default temperature, can be made configurable later
 
-        if (weatherModelMaxTokens && !isNaN(weatherModelMaxTokens) && weatherModelMaxTokens > 0) {
-            firstApiPayload.max_tokens = weatherModelMaxTokens;
-            console.log(`[WeatherFetch] 第一次天气 API 调用使用 MaxTokens: ${weatherModelMaxTokens}`);
-        }
+        console.log(`[WeatherFetch] Calling apiHelper.callApi for weather model: ${weatherModel}`);
+        const apiResponse = await apiHelper.callApi(
+            weatherModel,
+            [{ role: 'user', content: prompt }],
+            weatherTemperature,
+            weatherModelMaxTokens,
+            true // useSearchTool must be true for weather fetching
+        );
 
-        let response = await fetch(`${apiUrl}/v1/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify(firstApiPayload),
-        });
-
-        if (!response.ok) {
-            throw new Error(`第一次天气 API 调用失败: ${response.status} ${response.statusText}`);
-        }
-
-        let data = await response.json();
-        // Removed Raw data log
-
-        const firstChoice = data.choices?.[0];
-        const message = firstChoice?.message;
-
-        // --- Check for Tool Calls ---
-        if (firstChoice?.finish_reason === 'tool_calls' && message?.tool_calls) {
-            // Removed log marker
-            const toolCalls = message.tool_calls;
-
-            // Prepare messages for the second API call
-            const messagesForSecondCall = [
-                { role: 'user', content: prompt }, // Original user prompt
-                message, // Assistant's message requesting tool call(s)
-            ];
-
-            // Add tool results (we assume the proxy handles execution, send back arguments as placeholder result)
-            for (const toolCall of toolCalls) {
-                 if (toolCall.type === 'function' && toolCall.function.name === 'google_search') {
-                     // Removed tool result log
-                     messagesForSecondCall.push({
-                         role: 'tool',
-                         tool_call_id: toolCall.id,
-                         // Since server.js doesn't execute the search, we send back the arguments
-                         // The proxy at localhost:3000 should ideally use this or have already executed it.
-                         content: `Tool call requested with arguments: ${toolCall.function.arguments}`,
-                     });
-                 }
-            }
-
-            // --- Second API Call ---
-            // Removed log marker
-            const secondApiPayload = {
-                model: weatherModel,
-                messages: messagesForSecondCall,
-            };
-
-            // weatherModelMaxTokens is defined at the top of fetchAndUpdateWeather
-            if (weatherModelMaxTokens && !isNaN(weatherModelMaxTokens) && weatherModelMaxTokens > 0) {
-                secondApiPayload.max_tokens = weatherModelMaxTokens;
-                console.log(`[WeatherFetch] 第二次天气 API 调用使用 MaxTokens: ${weatherModelMaxTokens}`);
-            }
-
-            response = await fetch(`${apiUrl}/v1/chat/completions`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${apiKey}`,
-                },
-                // Send the history including the tool call request and our constructed tool result
-                // DO NOT send 'tools' or 'tool_choice' in the second call
-                body: JSON.stringify(secondApiPayload),
-            });
-
-            if (!response.ok) {
-                throw new Error(`第二次天气 API 调用失败: ${response.status} ${response.statusText}`);
-            }
-
-            data = await response.json();
-            // Removed Raw data log
+        let weatherContent = '';
+        if (apiResponse.type === 'content') {
+            weatherContent = apiResponse.content;
+            console.log('[WeatherFetch] Received content from apiHelper:', weatherContent.substring(0, 200) + "...");
         } else {
-             // Removed log marker
+            // apiResponse.type === 'error'
+            console.error('[WeatherFetch] Error from apiHelper.callApi:', apiResponse.error);
+            // Propagate the error or handle it to set cachedWeatherInfo appropriately
+            // For now, we'll let the existing catch block in fetchAndUpdateWeather handle it
+            // by throwing a new error, or we can directly set cachedWeatherInfo.
+            // throw new Error(`apiHelper.callApi failed: ${apiResponse.error}`);
+            // Or, more directly:
+            cachedWeatherInfo = `获取天气信息时出错 (apiHelper): ${apiResponse.error}`;
+            // If we set cachedWeatherInfo here, we might want to return early or ensure
+            // the rest of the function doesn't try to process an empty weatherContent.
+            // For simplicity, we'll let the existing error handling in the outer try-catch
+            // and the [WeatherInfo:...] extraction logic handle an empty/error string.
+            // The console.warn below will indicate failure to extract.
         }
-
-        // --- Process Final Response ---
-        let weatherContent = data.choices?.[0]?.message?.content || '';
-        console.log('Final extracted content:', weatherContent); // Keep log for final content
-        // Removed log marker
 
         const match = weatherContent.match(/\[WeatherInfo:(.*?)\]/s); // 使用 s 标志使 . 匹配换行符
         if (match && match[1]) {
