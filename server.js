@@ -8,6 +8,7 @@ const fs = require('fs').promises; // 使用 fs.promises 进行异步文件操�
 const path = require('path');
 const { Writable } = require('stream'); // 引入 Writable 用于收集流数据
 const crypto = require('crypto'); // 新增：用于生成 UUID
+const cors = require('cors'); // <--- 引入 cors
 
 // 加载环境变量
 dotenv.config({ path: 'config.env' });
@@ -73,6 +74,11 @@ if (superDetectors.length > 0) {
 // --- 全局上下文转换规则读取结束 ---
 
 const app = express();
+
+// --- 在这里使用 CORS 中间件 ---
+app.use(cors()); // <--- 添加这行以允许所有来源的请求
+// -----------------------------
+
 const port = process.env.PORT; // 从 env 或默认值获取端口
 const apiKey = process.env.API_Key; // API 服务器密钥
 const apiUrl = process.env.API_URL; // API 服务器地址
@@ -521,7 +527,7 @@ async function handleDailyNote(noteBlockContent) {
     // console.log('[handleDailyNote] 开始处理新的结构化日记块...');
     const lines = noteBlockContent.trim().split('\n');
     let maidName = null;
-    let dateString = null;
+    let dateString = null; // 这个是从日记内容中解析出来的日期，例如 "2025.5.7"
     let contentLines = [];
     let isContentSection = false;
 
@@ -529,83 +535,66 @@ async function handleDailyNote(noteBlockContent) {
         const trimmedLine = line.trim();
         if (trimmedLine.startsWith('Maid:')) {
             maidName = trimmedLine.substring(5).trim();
-            isContentSection = false; // 遇到新 Key，重置 Content 标记
+            isContentSection = false;
         } else if (trimmedLine.startsWith('Date:')) {
-            dateString = trimmedLine.substring(5).trim();
+            dateString = trimmedLine.substring(5).trim(); // 这是AI生成内容中标注的日期
             isContentSection = false;
         } else if (trimmedLine.startsWith('Content:')) {
             isContentSection = true;
-            // 如果 Content: 后面同一行有内容，也算进去
             const firstContentPart = trimmedLine.substring(8).trim();
             if (firstContentPart) {
                 contentLines.push(firstContentPart);
             }
         } else if (isContentSection) {
-            // Content: 之后的所有行都属于内容
-            contentLines.push(line); // 保留原始行的缩进和格式
+            contentLines.push(line);
         }
     }
 
-    const contentText = contentLines.join('\n').trim(); // 组合内容并去除首尾空白
+    const contentText = contentLines.join('\n').trim();
 
     if (!maidName || !dateString || !contentText) {
         console.error('[handleDailyNote] 无法从日记块中完整提取 Maid, Date, 或 Content:', { maidName, dateString, contentText: contentText.substring(0,100)+ '...' });
         return;
     }
 
-    // console.log(`[handleDailyNote] 提取信息: Maid=${maidName}, Date=${dateString}`);
-    const datePart = dateString.replace(/[.-]/g, '.'); // 统一日期分隔符
+    const datePart = dateString.replace(/[.-]/g, '.'); // AI生成内容中的日期，用于文件名 e.g., "2025.5.7"
     const dirPath = path.join(__dirname, 'dailynote', maidName);
-    const baseFileNameWithoutExt = datePart; // e.g., "2025.5.2"
+    const baseFileNameWithoutExt = datePart;
     const fileExtension = '.txt';
-    let finalFileName = `${baseFileNameWithoutExt}${fileExtension}`; // Initial filename, e.g., "2025.5.2.txt"
+    const finalFileName = `${baseFileNameWithoutExt}${fileExtension}`; // 文件名固定 e.g., "2025.5.7.txt"
     let filePath = path.join(dirPath, finalFileName);
-    let counter = 1;
 
-    // console.log(`[handleDailyNote] 准备写入日记: 目录=${dirPath}, 基础文件名=${baseFileNameWithoutExt}`);
-    // console.log(`[handleDailyNote] 日记文本内容 (前100字符): ${contentText.substring(0, 100)}...`);
+    // 获取当前精确时间用于时间戳
+    const now = new Date();
+    const currentTime = now.toLocaleTimeString('zh-CN', {
+        hour12: false, // 24小时制
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        timeZone: 'Asia/Shanghai' // 确保时区一致
+    }); // 例如 "14:35:07"
+
+    // 准备要追加的内容，包含时间戳
+    // datePart 是从AI内容中解析的日期，currentTime 是当前的实际写入时间
+    const contentToAppend = `[${datePart} ${currentTime}] - ${maidName}\n${contentText}\n\n`; // 每条记录后加两个换行作为分隔
 
     try {
-        // 确保目录存在
-        // console.log(`[handleDailyNote] 尝试创建目录: ${dirPath}`);
         await fs.mkdir(dirPath, { recursive: true });
         // console.log(`[handleDailyNote] 目录已确保存在或已存在: ${dirPath}`);
 
-        // 循环检查文件名是否存在，如果存在则尝试添加序号
-        while (true) {
-            try {
-                await fs.access(filePath, fs.constants.F_OK); // 检查文件是否存在
-                // 文件存在，生成下一个带序号的文件名
-                finalFileName = `${baseFileNameWithoutExt}(${counter})${fileExtension}`; // e.g., "2025.5.2(1).txt"
-                filePath = path.join(dirPath, finalFileName);
-                counter++;
-                // console.log(`[handleDailyNote] 文件已存在，尝试下一个序号: ${finalFileName}`);
-            } catch (err) {
-                // 如果错误是 ENOENT (文件不存在)，说明找到了可用的文件名
-                if (err.code === 'ENOENT') {
-                    // console.log(`[handleDailyNote] 找到可用文件名: ${finalFileName}`);
-                    break; // 跳出循环，使用当前的 filePath
-                } else {
-                    // 如果是其他访问错误，则抛出异常
-                    console.error(`[handleDailyNote] 检查文件 ${filePath} 存在性时发生意外错误:`, err);
-                    throw err; // 重新抛出未预期的错误
-                }
-            }
-        }
+        // 使用 appendFile 来追加内容，如果文件不存在则会创建它
+        await fs.appendFile(filePath, contentToAppend, 'utf8');
+        console.log(`[handleDailyNote] 日记内容已追加到文件: ${filePath}`);
 
-        // 使用找到的最终文件名写入文件
-        // console.log(`[handleDailyNote] 最终尝试写入文件: ${filePath}`);
-        await fs.writeFile(filePath, `[${datePart}] - ${maidName}\n${contentText}`); // 在内容前添加 [日期] - 署名 头
-        console.log(`[handleDailyNote] 日记文件写入成功: ${filePath}`); // 记录最终写入的文件路径
     } catch (error) {
         // 保持现有的详细错误日志记录
-        console.error(`[handleDailyNote] 处理日记文件 ${filePath} 时捕获到错误 (最终尝试的文件路径):`); // 指明这是最终尝试的路径
+        console.error(`[handleDailyNote] 处理日记文件 ${filePath} 时捕获到错误:`);
         console.error(`  错误代码 (code): ${error.code}`);
         console.error(`  系统调用 (syscall): ${error.syscall}`);
         console.error(`  路径 (path): ${error.path}`);
         console.error(`  错误号 (errno): ${error.errno}`);
         console.error(`  错误信息 (message): ${error.message}`);
-        console.error(`  错误堆栈 (stack): ${error.stack}`);
+        // console.error(`  错误堆栈 (stack): ${error.stack}`); // 堆栈信息可能过长，暂时注释
     }
 }
 
